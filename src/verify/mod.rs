@@ -1,8 +1,4 @@
 use crate::policy::Policy;
-#[cfg(not(test))]
-use crate::registry::config::DockerConfig;
-#[cfg(test)]
-use crate::registry::config::MockDockerConfig as DockerConfig;
 use crate::sources::Sources;
 
 use anyhow::{anyhow, Result};
@@ -14,7 +10,9 @@ use oci_distribution::Reference;
 use sigstore::errors::SigstoreError;
 use std::convert::TryFrom;
 use std::{convert::TryInto, str::FromStr};
+use oci_distribution::secrets::RegistryAuth;
 use tracing::{debug, error, info, warn};
+use crate::Registry;
 
 /// This structure simplifies the process of policy verification
 /// using Sigstore
@@ -123,7 +121,6 @@ impl Verifier {
     pub async fn verify(
         &mut self,
         image_url: &str,
-        docker_config: Option<&DockerConfig>,
         verification_config: &config::LatestVerificationConfig,
     ) -> Result<String> {
         // obtain image name:
@@ -140,30 +137,15 @@ impl Verifier {
         }
 
         // obtain registry auth:
-        //
-        let auth: sigstore::registry::Auth = match docker_config {
-            Some(docker_config) => {
-                let sigstore_auth: Option<Result<sigstore::registry::Auth>> = docker_config
-                    .auth(image_name)
-                    .map_err(|e| {
-                        anyhow!(
-                            "Cannot build Auth object for image '{}': {:?}",
-                            image_url,
-                            e
-                        )
-                    })?
-                    .map(|ra| {
-                        let a: Result<sigstore::registry::Auth> =
-                            TryInto::<sigstore::registry::Auth>::try_into(ra);
-                        a
-                    });
+        let auth = Registry::auth(image_url);
 
-                match sigstore_auth {
-                    None => sigstore::registry::Auth::Anonymous,
-                    Some(sa) => sa?,
-                }
+        let sigstore_auth = match auth {
+            RegistryAuth::Anonymous => {
+                sigstore::registry::Auth::Anonymous
             }
-            None => sigstore::registry::Auth::Anonymous,
+            RegistryAuth::Basic(username, password) => {
+                sigstore::registry::Auth::Basic(username, password)
+            }
         };
 
         // obtain all signatures of image:
@@ -172,11 +154,11 @@ impl Verifier {
         // Fulcio,Rekor certs and signatures are not verified
         //
         let (cosign_signature_image, source_image_digest) =
-            self.cosign_client.triangulate(image_name, &auth).await?;
+            self.cosign_client.triangulate(image_name, &sigstore_auth).await?;
 
         let trusted_layers = match self
             .cosign_client
-            .trusted_signature_layers(&auth, &source_image_digest, &cosign_signature_image)
+            .trusted_signature_layers(&sigstore_auth, &source_image_digest, &cosign_signature_image)
             .await
         {
             Ok(trusted_layers) => trusted_layers,
@@ -209,7 +191,6 @@ impl Verifier {
     pub async fn verify_local_file_checksum(
         &mut self,
         policy: &Policy,
-        docker_config: Option<&DockerConfig>,
         verified_manifest_digest: &str,
     ) -> Result<()> {
         let image_name = match policy.uri.strip_prefix("registry://") {
@@ -230,7 +211,7 @@ impl Verifier {
             ));
         }
 
-        let registry = crate::registry::Registry::new(docker_config);
+        let registry = crate::registry::Registry{};
         let reference = oci_distribution::Reference::from_str(image_name)?;
         let image_immutable_ref = format!(
             "registry://{}/{}@{}",
